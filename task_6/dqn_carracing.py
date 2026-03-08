@@ -1,4 +1,4 @@
-# Structure:
+# RL Structure:
 # environment
 # agent
 # replay memory
@@ -25,7 +25,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 writer = SummaryWriter("tensorboard_logs")
 
 
-
 # Discretized Action Space
 
 actions = [
@@ -35,7 +34,6 @@ actions = [
     np.array([0,0,0.8], dtype=np.float32),
     np.array([0,0,0], dtype=np.float32),
 ]
-
 
 
 # Transition Object
@@ -48,7 +46,6 @@ class Transition:
         self.reward = reward
         self.next_state = next_state
         self.done = done
-
 
 
 # Q Network
@@ -76,11 +73,14 @@ class QNetwork(nn.Module):
 
 class DQNAgent:
 
-    def __init__(self, env):
+    def __init__(self, env, actions, writer):
 
         self.env = env
+        self.actions = actions
+        self.writer = writer
 
-        self.state_dim = 96*96*3
+        # derive state dimension from environment
+        self.state_dim = int(np.prod(env.observation_space.shape))
         self.action_dim = len(actions)
 
         self.gamma = 0.99
@@ -143,7 +143,10 @@ class DQNAgent:
         states = torch.tensor(states).float().to(device)
         next_states = torch.tensor(next_states).float().to(device)
         rewards = torch.tensor(rewards).float().to(device)
-        dones = torch.tensor(dones).float().to(device)
+
+        # explicitly convert done flags
+        dones = torch.tensor(dones, dtype=torch.float32, device=device)
+
         actions_b = torch.tensor(actions_b).to(device)
 
         q_values = self.online_net(states).gather(1, actions_b.unsqueeze(1)).squeeze()
@@ -163,7 +166,7 @@ class DQNAgent:
 
         self.loss_history.append(loss.item())
 
-        writer.add_scalar("train/loss", loss.item(), global_step)
+        self.writer.add_scalar("train/loss", loss.item(), global_step)
 
 
     def decay_epsilon(self):
@@ -171,12 +174,11 @@ class DQNAgent:
 
 
 
-
 # Training Loop
 
 env = gym.make("CarRacing-v3", render_mode="rgb_array")
 
-agent = DQNAgent(env)
+agent = DQNAgent(env, actions, writer)
 
 episodes = 150
 
@@ -197,7 +199,7 @@ for episode in range(episodes):
     while not done:
 
         action_index = agent.select_action(state)
-        action = actions[action_index]
+        action = agent.actions[action_index]
 
         next_state,reward,terminated,truncated,_ = env.step(action)
 
