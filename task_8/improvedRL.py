@@ -1,379 +1,223 @@
-# Improved DQN Implementation
-#
-# I improved my previous DQN algorithm with some refinements:
-# - CNN feature extractor for image observations
-# - Double DQN target calculation to reduce Q-value overestimation
-# - Linear epsilon decay schedule for more stable exploration
+# Goals for Fine-Tuning:
 
-# RL Structure
-# 1. Environment
-# 2. Agent
-# 3. Replay Memory
-# 4. Training Loop
-# 5. Evaluation Metrics
-# 6. Plots
+# DDQN in DQNAgent.py
+# We will be using a double DQN (DDQN) because standard DQN has an issue where it overestimates how "good" actions are.
+# DDQN fixes this "overestimation bias" by decoupling the target calculation: we use the Online Network to choose the best next action, 
+# but we use the Target Network to evaluate exactly how many points that action is worth.
 
+# Huber Loss (SmoothL1Loss) and Adam Optimizer in DQNAgent.py
+# We are swapping out Mean Squared Error (MSE) for Huber Loss. It acts like a parabola (MSE) for small errors, 
+# but turns into a straight line for massive errors. This acts as a permanent safety net against exploding gradients.
+# 
+# We are replacing RMSProp with Adam, which adjusts the learning rate for each individual parameter and generally 
+# leads to faster convergence in RL architectures.
+
+# Frame Skipping
+# The 2013 DQN research paper states that the agent sees and selects actions on every k^th frame instead of every frame, 
+# and its last action is repeated on skipped frames. We are injecting a wrapper to skip 4 frames at a time, 
+# allowing the agent to learn momentum and significantly speeding up training time.
+
+# Warmup Phase
+# We added a pre-training loop where the agent takes random actions to fill the replay memory, 
+# so the neural network has a diverse dataset the second it begins learning.
+
+
+# Refinements included: Frame Skipping, Double DQN, Huber Loss, Adam Optimizer, and Warmup Phase.
 
 import gymnasium as gym
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
-import random
+import cv2
 import matplotlib.pyplot as plt
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
 import os
 
-# Create directory for saving plots if it does not already exist
+# our modular agent
+from DQNAgent import DQNAgent
+
+BASE_DIR = os.path.dirname(__file__)
 os.makedirs("plots", exist_ok=True)
+writer = SummaryWriter(log_dir="tensorboard_logs")
 
-# Automatically use GPU if available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# TensorBoard logger for training metrics
-writer = SummaryWriter("tensorboard_logs")
-
-
-
-# Discretized Action Space
-
-# CarRacing uses continuous actions: [steering, gas, brake]
-# Since DQN requires discrete actions, we approximate the space
-# using a small set of representative actions.
-actions = [
-    np.array([-1,0,0], dtype=np.float32),   # steer left
-    np.array([1,0,0], dtype=np.float32),    # steer right
-    np.array([0,1,0], dtype=np.float32),    # accelerate
-    np.array([0,0,0.8], dtype=np.float32),  # brake
-    np.array([0,0,0], dtype=np.float32),    # no action
+# Actions for Car Racing Environment
+car_actions = [
+    np.array([-1, 0, 0], dtype=np.float32),   # steer left
+    np.array([1, 0, 0], dtype=np.float32),    # steer right
+    np.array([0, 1, 0], dtype=np.float32),    # accelerate
+    np.array([0, 0, 0.8], dtype=np.float32),  # brake
+    np.array([0, 0, 0], dtype=np.float32),    # no action
 ]
 
+# Refinement: Frame Skipping Wrapper
+class SkipFrame(gym.Wrapper):
+    def __init__(self, env, skip=4):
+        super().__init__(env)
+        self._skip = skip
 
+    def step(self, action):
+        total_reward = 0.0
+        for _ in range(self._skip):
+            state, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += reward
+            if terminated or truncated:
+                break
+        return state, total_reward, terminated, truncated, info
 
-# Transition Object (Replay Memory Entry)
-
-# Stores one step of interaction with the environment
-class Transition:
-
-    def __init__(self, state, action, reward, next_state, done):
-        self.state = state
-        self.action = action
-        self.reward = reward
-        self.next_state = next_state
-        self.done = done
-
-
-
-# CNN Q-Network
-
-# Convolutional layers extract spatial features from the image
-# Fully connected layers then predict Q-values for each action.
-class QNetwork(nn.Module):
-
-    def __init__(self, input_shape, action_dim):
-
-        super().__init__()
-
-        c,h,w = input_shape
-
-        # Convolutional feature extractor
-        # DeepMind Atari architecture
-        self.conv = nn.Sequential(
-            nn.Conv2d(c,32,8,stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32,64,4,stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64,64,3,stride=1),
-            nn.ReLU()
-        )
-
-        # Determine flattened feature size automatically
-        # by passing a dummy tensor through the CNN
-        with torch.no_grad():
-            sample = torch.zeros(1,c,h,w)
-            conv_out = self.conv(sample)
-            conv_size = conv_out.view(1,-1).shape[1]
-
-        # Fully connected layers for Q-value prediction
-        self.fc = nn.Sequential(
-            nn.Linear(conv_size,512),
-            nn.ReLU(),
-            nn.Linear(512,action_dim)
-        )
-
-    def forward(self,x):
-
-        # Extract features with CNN
-        x = self.conv(x)
-
-        # Flatten features before feeding to FC layers
-        x = torch.flatten(x,1)
-
-        return self.fc(x)
-
-
-
-
-# DQN Agent
-
-class DQNAgent:
-
+# Same Preprocessing function from Task 6
+class ImagePreprocessingWrapper(gym.ObservationWrapper):
     def __init__(self, env):
+        super().__init__(env)
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=(4, 84, 84), dtype=np.uint8)
+        self.frames = deque(maxlen=4)
 
-        self.env = env
+    def reset(self, **kwargs):
+        state, info = self.env.reset(**kwargs)
+        processed_state = self._process_image(state)
+        for _ in range(4):
+            self.frames.append(processed_state)
+        return np.stack(self.frames, axis=0), info
 
-        # Observation shape from environment (96x96x3)
-        obs_shape = env.observation_space.shape
+    def step(self, action):
+        state, reward, terminated, truncated, info = self.env.step(action)
+        processed_state = self._process_image(state)
+        self.frames.append(processed_state)
+        return np.stack(self.frames, axis=0), reward, terminated, truncated, info
 
-        # Convert to PyTorch format (C,H,W)
-        self.input_shape = (obs_shape[2], obs_shape[0], obs_shape[1])
+    def _process_image(self, image):
+        grayscale = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) # Grayscale the images
+        resized = cv2.resize(grayscale, (84, 84), interpolation=cv2.INTER_AREA)
+        return resized
 
-        self.action_dim = len(actions)
+# Same carRacing function, but with frame skipping included
+def run_carRacing(episodes: int = 100, max_steps: int = 1000, render_mode: str = "rgb_array", is_training: bool = True, is_warmup: bool = False):
+    base_env = gym.make("CarRacing-v2", render_mode=render_mode)
+    env = SkipFrame(base_env, skip=4)
+    env = ImagePreprocessingWrapper(env)
+    agent.env = env
 
-        # Discount factor
-        self.gamma = 0.99
+    global_step = 0
+    recent_scores = []
+    
+    reward_history = []
+    epsilon_history = []
 
-        # Improved epsilon exploration schedule
-        self.epsilon = 1.0
-        self.epsilon_min = 0.05
-        self.epsilon_decay_steps = 50000
+    for ep in range(episodes):
+        state, info = env.reset()
+        total_score = 0.0
+        steps_taken = 0
 
-        self.batch_size = 32
+        for t in range(max_steps):
+            if is_warmup:
+                action_idx = np.random.randint(0, agent.action_dim)
+            else:
+                action_idx = agent.choose_action(state)
+                
+            actual_action = car_actions[action_idx]
+            
+            next_state, reward, terminated, truncated, info = env.step(actual_action)
+            done = terminated or truncated
 
-        # Experience replay buffer
-        self.memory = deque(maxlen=50000)
+            # Clip reward for stability during training
+            clipped_reward = np.clip(reward, -1, 1) if (is_training or is_warmup) else reward
 
-        # Online network learns Q-values
-        self.online_net = QNetwork(self.input_shape, self.action_dim).to(device)
+            if is_training or is_warmup:
+                agent.step(state, action_idx, clipped_reward, next_state, done, global_step, is_warmup=is_warmup)
 
-        # Target network stabilizes training
-        self.target_net = QNetwork(self.input_shape, self.action_dim).to(device)
+            total_score += reward
+            state = next_state
+            steps_taken += 1
+            global_step += 1
 
-        self.sync_networks()
-
-        self.optimizer = optim.Adam(self.online_net.parameters(), lr=1e-4)
-
-        # Huber loss (SmoothL1) is commonly used in DQN
-        self.loss_fn = nn.SmoothL1Loss()
-
-        self.loss_history = []
-
-
-    def preprocess(self, state):
-
-        # Convert image to float and normalize to [0,1]
-        state = np.asarray(state, dtype=np.float32)/255.0
-
-        # Convert from HWC (Gym format) to CHW (PyTorch format)
-        state = np.transpose(state,(2,0,1))
-
-        return torch.tensor(state).unsqueeze(0).to(device)
-
-
-    def sync_networks(self):
-
-        # Copy weights from online network to target network
-        self.target_net.load_state_dict(self.online_net.state_dict())
-
-
-    def store(self, state, action, reward, next_state, done):
-
-        # Save transition in replay memory
-        transition = Transition(state, action, reward, next_state, done)
-        self.memory.append(transition)
-
-
-    def select_action(self, state, global_step):
-
-        # Epsilon-greedy exploration
-        if random.random() < self.epsilon:
-            return random.randint(0,self.action_dim-1)
-
-        state_t = self.preprocess(state)
-
-        # Choose action with highest predicted Q-value
-        with torch.no_grad():
-            q_values = self.online_net(state_t)
-
-        return int(torch.argmax(q_values).item())
-
-
-    def train(self, global_step):
-
-        # Wait until replay buffer has enough samples
-        if len(self.memory) < self.batch_size:
-            return
-
-        batch = random.sample(self.memory,self.batch_size)
-
-        # Convert batch to arrays
-        states = np.array([t.state for t in batch])
-        actions_b = np.array([t.action for t in batch])
-        rewards = np.array([t.reward for t in batch])
-        next_states = np.array([t.next_state for t in batch])
-        dones = np.array([t.done for t in batch])
-
-        # Convert to tensors and normalize images
-        states = torch.tensor(states).float().permute(0,3,1,2).to(device)/255.0
-        next_states = torch.tensor(next_states).float().permute(0,3,1,2).to(device)/255.0
-
-        rewards = torch.tensor(rewards).float().to(device)
-        dones = torch.tensor(dones).float().to(device)
-        actions_b = torch.tensor(actions_b).to(device)
-
-
-        # Current Q-values for selected actions
-        q_values = self.online_net(states).gather(1, actions_b.unsqueeze(1)).squeeze()
-
-
+            if done:
+                break
         
-        # Double DQN target calculation
-        
+        if is_training and not is_warmup:
+            agent.reduce_epsilon()
 
-        # Online network chooses the best next action
-        next_actions = self.online_net(next_states).argmax(1)
+        recent_scores.append(total_score)
+        if len(recent_scores) > 10:
+            recent_scores.pop(0)
+        avg_10 = sum(recent_scores) / len(recent_scores)
 
-        # Target network evaluates that action
-        next_q = self.target_net(next_states).gather(
-            1,
-            next_actions.unsqueeze(1)
-        ).squeeze()
+        if is_training and not is_warmup:
+            reward_history.append(total_score)
+            epsilon_history.append(agent.epsilon)
+            
+            writer.add_scalar("episode/return", total_score, ep)
+            writer.add_scalar("episode/length", steps_taken, ep)
+            writer.add_scalar("episode/epsilon", agent.epsilon, ep)
+            writer.add_scalar("episode/return_avg10", avg_10, ep)
 
-        # Bellman target
-        target = rewards + self.gamma * next_q * (1 - dones)
+        if not is_warmup:
+            print(f"{' Test' if not is_training else ' Train'} Episode {ep+1}: steps={steps_taken}, total_score={total_score:.1f}, eps={agent.epsilon:.3f}")
+        else:
+            if (ep + 1) % 10 == 0:
+                print(f" Warmup Episode {ep+1}/{episodes} complete.")
 
-        loss = self.loss_fn(q_values, target.detach())
-
-        self.optimizer.zero_grad()
-        loss.backward()
-
-        # Gradient clipping helps prevent unstable updates
-        torch.nn.utils.clip_grad_norm_(self.online_net.parameters(),10.0)
-
-        self.optimizer.step()
-
-        self.loss_history.append(loss.item())
-
-        writer.add_scalar("train/loss", loss.item(), global_step)
+    env.close()
+    return reward_history, epsilon_history
 
 
-    def decay_epsilon(self, global_step):
+# Parameters
+train_episodes = 1000
+warmup_episodes = 50
+learning_rate = 0.0001 # slightly lower learning rate
+start_epsilon = 1.0
+epsilon_decay = 1.0 / train_episodes 
+min_epsilon = 0.1
 
-        # Linear epsilon decay over training steps
-        self.epsilon = max(
-            self.epsilon_min,
-            1.0 - global_step / self.epsilon_decay_steps
-        )
+dummy_env = gym.make("CarRacing-v2", render_mode="rgb_array")
+wrapped_dummy = SkipFrame(dummy_env, skip=4)
+wrapped_dummy = ImagePreprocessingWrapper(wrapped_dummy)
 
+# agent
+agent = DQNAgent(
+    env=wrapped_dummy, 
+    action_dim=len(car_actions), 
+    writer=writer, 
+    lr=learning_rate, 
+    start_epsilon=start_epsilon, 
+    epsilon_decay=epsilon_decay, 
+    min_epsilon=min_epsilon
+)
 
+# Warmup
+print("Warmup")
+run_carRacing(episodes=warmup_episodes, is_training=False, is_warmup=True)
 
+# Training
+print("Training")
+reward_history, epsilon_history = run_carRacing(episodes=train_episodes, is_training=True, is_warmup=False)
 
-# Training Loop
+# Test
+print("\nTesting")
+agent.epsilon = 0.0 
+run_carRacing(episodes=5, render_mode="human", is_training=False, is_warmup=False)
 
-
-env = gym.make("CarRacing-v3", render_mode="rgb_array")
-
-agent = DQNAgent(env)
-
-episodes = 1000
-
-reward_history = []
-epsilon_history = []
-
-global_step = 0
-recent_rewards = []
-
-for episode in range(episodes):
-
-    state,_ = env.reset()
-
-    done = False
-    total_reward = 0
-    episode_steps = 0
-
-    # Run one episode
-    while not done:
-
-        action_index = agent.select_action(state, global_step)
-        action = actions[action_index]
-
-        next_state,reward,terminated,truncated,_ = env.step(action)
-
-        done = terminated or truncated
-
-        # Store transition in replay memory
-        agent.store(state,action_index,reward,next_state,done)
-
-        # Train the Q-network
-        agent.train(global_step)
-
-        # Update exploration rate
-        agent.decay_epsilon(global_step)
-
-        state = next_state
-
-        total_reward += reward
-        episode_steps += 1
-        global_step += 1
-
-    reward_history.append(total_reward)
-
-    epsilon_history.append(agent.epsilon)
-
-    # Periodically update target network
-    if global_step % 5000 == 0:
-        agent.sync_networks()
-
-    # Track recent performance
-    recent_rewards.append(total_reward)
-    if len(recent_rewards) > 10:
-        recent_rewards.pop(0)
-
-    avg_reward = np.mean(recent_rewards)
-
-    # Log metrics to TensorBoard
-    writer.add_scalar("episode/reward", total_reward, episode)
-    writer.add_scalar("episode/length", episode_steps, episode)
-    writer.add_scalar("episode/epsilon", agent.epsilon, episode)
-    writer.add_scalar("episode/reward_avg10", avg_reward, episode)
-
-    print("Episode:",episode,"Reward:",total_reward,"Epsilon:",agent.epsilon)
-
-env.close()
 writer.close()
 
-
-
-
 # Plotting Results
-
-
-# Episode reward over time
 plt.figure()
 plt.plot(reward_history)
 plt.title("Episode Reward")
 plt.xlabel("Episode")
 plt.ylabel("Reward")
-plt.savefig("plots/reward_curve.png")
+plt.savefig("plots/reward_curve_task8.png")
 
-# Training loss
 plt.figure()
-plt.plot(agent.loss_history)
+plt.plot(agent.training_error)
 plt.title("Training Loss")
 plt.xlabel("Training Step")
 plt.ylabel("Loss")
-plt.savefig("plots/loss_curve.png")
+plt.savefig("plots/loss_curve_task8.png")
 
-# Exploration rate decay
 plt.figure()
 plt.plot(epsilon_history)
 plt.title("Exploration Rate")
 plt.xlabel("Episode")
 plt.ylabel("Epsilon")
-plt.savefig("plots/exploration_curve.png")
+plt.savefig("plots/exploration_curve_task8.png")
 
-# Moving average reward to smooth noise
 window = 5
 moving_avg = np.convolve(reward_history, np.ones(window)/window, mode='valid')
 
@@ -382,8 +226,4 @@ plt.plot(moving_avg)
 plt.title("Moving Average Reward")
 plt.xlabel("Episode")
 plt.ylabel("Reward")
-plt.savefig("plots/moving_average_reward.png")
-
-print("Training complete.")
-print("Plots saved in /plots")
-print("TensorBoard logs saved in /tensorboard_logs")
+plt.savefig("plots/moving_average_reward_task8.png")
