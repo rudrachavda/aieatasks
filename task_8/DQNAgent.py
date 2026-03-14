@@ -31,8 +31,8 @@ class ConvQNetwork(nn.Module):
             nn.Linear(256, action_dim)
         )
 
-    def forward(self, x):
-        return self.conv_layers(x)
+    def forward(self, input):
+        return self.conv_layers(input)
 
 # Same Agent with minor refinements
 class DQNAgent:

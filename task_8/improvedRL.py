@@ -21,6 +21,7 @@
 # We added a pre-training loop where the agent takes random actions to fill the replay memory, 
 # so the neural network has a diverse dataset the second it begins learning.
 
+# I took some inspiration for implementing DDQN and Frame skipping from https://github.com/wiitt/DQN-Car-Racing/blob/main/DQN_model.py.
 
 # Refinements included: Frame Skipping, Double DQN, Huber Loss, Adam Optimizer, and Warmup Phase.
 

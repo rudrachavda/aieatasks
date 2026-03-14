@@ -1,4 +1,4 @@
-# From the DQN paper I learned:
+# From the DQN (Deep Q Network) paper I learned:
 # The paper uses a convolutional neural network whose input is raw pixels.
 # I need to implement a preprocessing step that converts images to grayscale and stacks the last 4 frames of history to produce the input to the Q-Function.
 
@@ -11,6 +11,9 @@
 
 # Car Racing only gives the agent a 96 x 96 pixel video feed, so if I try to force CarRacing through a linear network without using a CNN, I have to flatten the image into a 1D line of pixels.
 # This would not be good for the spatial awareness of the agent and probably cause either a capacity collapse (no reward curve), and the agent would never learn how to drive.
+# Other simulation environments like Cart-Pole would give the agent a simple array of 4 numbers (cart position, cart velocity, pole angle, pole velocity), so I would need to make up for these variables.
+
+# I took inspiration from this https://github.com/wiitt/DQN-Car-Racing to write the code for my DQN agent. 
 
 import gymnasium as gym
 import random
@@ -30,7 +33,7 @@ LOG_DIR = os.path.join(BASE_DIR, "tensorboard_logs")
 os.makedirs("plots", exist_ok=True)
 writer = SummaryWriter(log_dir="tensorboard_logs")
 
-# Actions for CarRacing Environment
+# Actions for Car Racing Environment
 car_actions = [
     np.array([-1, 0, 0], dtype=np.float32),   # steer left
     np.array([1, 0, 0], dtype=np.float32),    # steer right
@@ -39,7 +42,7 @@ car_actions = [
     np.array([0, 0, 0], dtype=np.float32),    # no action
 ]
 
-# Image preprocessing for CarRacing Environment
+# Image preprocessing for Car Racing Environment
 class ImagePreprocessingWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -152,7 +155,7 @@ class DQNAgent:
     def sync_networks(self):
         self.target_net.load_state_dict(self.online_net.state_dict())
         
-    def reduce_epsilon(self): # using linear epsilon decay, 
+    def reduce_epsilon(self): # using linear epsilon decay 
         self.epsilon = max(self.min_epsilon, self.epsilon - self.epsilon_decay)
 
     def train_network(self, global_step):
@@ -271,7 +274,13 @@ min_epsilon = 0.1
 dummy_env = gym.make("CarRacing-v2", render_mode="rgb_array")
 wrapped_dummy = ImagePreprocessingWrapper(dummy_env)
 
-agent = DQNAgent(wrapped_dummy, learning_rate, start_epsilon, epsilon_decay, min_epsilon)
+agent = DQNAgent(
+    wrapped_dummy, 
+    learning_rate, 
+    start_epsilon, 
+    epsilon_decay, 
+    min_epsilon
+)
 
 # Train
 print("Training")
@@ -280,8 +289,6 @@ reward_history, epsilon_history = run_carRacing(episodes=train_episodes, is_trai
 # Test
 print("\nTesting")
 agent.epsilon = 0.0 # Turn off random actions
-
-# The test phase uses human render mode so you can watch the agent drive. 
 run_carRacing(episodes=5, render_mode="human", is_training=False)
 
 writer.close()
